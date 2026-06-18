@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from contextlib import nullcontext
@@ -41,6 +42,17 @@ class WorkerProfiler(ABC):
         self._profiling_for_iters = 0
         self._running = False
 
+        # Cross-rank coordination of the profiler start/stop toggle.
+        # cudaProfilerStart/Stop are host-side toggles; if ranks flip them at
+        # different points relative to in-flight collectives (e.g. MoE all2all
+        # or the DP all-reduce) a multi-GPU run can wedge. Subclasses whose
+        # toggle is collective-sensitive (CUDA / nsys) opt in by setting this.
+        # Only the counter-driven transitions (delayed start / max-iteration
+        # stop) are coordinated, since those are iteration-aligned across DP
+        # ranks; the immediate start_profile / explicit stop_profile paths are
+        # not aligned and are intentionally left uncoordinated.
+        self._coordinate_toggle = False
+
     @abstractmethod
     def _start(self) -> None:
         """Start the profiler."""
@@ -51,16 +63,82 @@ class WorkerProfiler(ABC):
         """Stop the profiler."""
         pass
 
-    def _call_start(self) -> None:
+    def _toggle_coordination_enabled(self) -> bool:
+        # Escape hatch: VLLM_PROFILER_TOGGLE_SYNC=0/1 forces the behavior off/on.
+        override = os.environ.get("VLLM_PROFILER_TOGGLE_SYNC")
+        if override is not None:
+            return override == "1"
+        return self._coordinate_toggle
+
+    def _coordinate_toggle_rendezvous(self, tag: str) -> None:
+        """Quiesce the device and rendezvous across all ranks that share
+        deadlock-prone collectives, so the profiler toggle happens at the same
+        step boundary on every rank.
+
+        This is best-effort: any failure to resolve a process group degrades to
+        a purely local toggle rather than risking a hang. It must only be called
+        from iteration-aligned (counter-driven) transitions so that every rank
+        reaches the rendezvous on the same iteration.
+        """
+        if not self._toggle_coordination_enabled():
+            return
+        try:
+            import torch.distributed as dist
+
+            if not (dist.is_available() and dist.is_initialized()):
+                return
+
+            from vllm.distributed.parallel_state import (
+                get_dp_group,
+                get_ep_group,
+                get_world_group,
+            )
+
+            # Pick the broadest group that spans the ranks sharing the
+            # collectives we must not interrupt: EP (MoE all2all) first, then
+            # DP (padding all-reduce), then the local world (TP/PP). All ranks
+            # resolve the same group because these sizes are global config.
+            group = None
+            for getter in (get_ep_group, get_dp_group, get_world_group):
+                try:
+                    coord = getter()
+                except Exception:
+                    continue
+                if coord is not None and coord.world_size > 1:
+                    group = coord.device_group
+                    break
+            if group is None:
+                return
+
+            torch.cuda.synchronize()
+            if dist.get_backend(group) == "nccl":
+                dist.barrier(group=group, device_ids=[torch.cuda.current_device()])
+            else:
+                dist.barrier(group=group)
+            torch.cuda.synchronize()
+            logger.info_once("Profiler toggle (%s) coordinated across ranks.", tag)
+        except Exception as e:
+            logger.warning(
+                "Profiler toggle (%s) cross-rank coordination failed; "
+                "toggling locally instead: %s",
+                tag,
+                e,
+            )
+
+    def _call_start(self, coordinate: bool = False) -> None:
         """Call _start with error handling but no safeguards."""
+        if coordinate:
+            self._coordinate_toggle_rendezvous("start")
         try:
             self._start()
             self._running = True  # Only mark as running if start succeeds
         except Exception as e:
             logger.warning("Failed to start profiler: %s", e)
 
-    def _call_stop(self) -> None:
+    def _call_stop(self, coordinate: bool = False) -> None:
         """Call _stop with error handling but no safeguards."""
+        if coordinate:
+            self._coordinate_toggle_rendezvous("stop")
         try:
             self._stop()
             logger.info_once("Profiler stopped successfully.")
@@ -94,7 +172,10 @@ class WorkerProfiler(ABC):
             and self._active_iteration_count == self._delay_iters
         ):
             logger.info_once("Starting profiler after delay...")
-            self._call_start()
+            # Counter-driven start: every rank trips on the same iteration, so
+            # coordinate the toggle to avoid a cross-rank cudaProfilerStart
+            # cascade wedging in-flight collectives.
+            self._call_start(coordinate=True)
 
         # Call profiler step for schedule-based profiling
         # Only count iterations where data is actually recorded (not warmup)
@@ -110,7 +191,8 @@ class WorkerProfiler(ABC):
             # will be marked as not running, but leave as active so that stop
             # can clean up properly
             logger.info_once("Max profiling iterations reached. Stopping profiler...")
-            self._call_stop()
+            # Counter-driven stop: iteration-aligned across ranks, so coordinate.
+            self._call_stop(coordinate=True)
             return
 
     def _profiler_step(self) -> bool:
@@ -314,6 +396,9 @@ class CudaProfilerWrapper(WorkerProfiler):
         import torch.cuda.profiler as cuda_profiler
 
         self._cuda_profiler = cuda_profiler
+        # cudaProfilerStart/Stop is collective-sensitive under DP/EP; coordinate
+        # the counter-driven toggle across ranks (nsys capture path).
+        self._coordinate_toggle = True
 
     @override
     def _start(self) -> None:

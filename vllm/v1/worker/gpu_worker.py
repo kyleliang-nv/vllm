@@ -779,7 +779,14 @@ class Worker(WorkerBase):
         if not self.profiler:
             return nullcontext()
 
-        self.profiler.step()
+        # Only advance the worker profiler counter on steps that run real model
+        # work. 0-token steps (e.g. KV-connector polling) are skipped by the
+        # engine-side iteration logger, and DP dummy steps are counted via
+        # execute_dummy_batch(). Keeping this counter 1:1 with the engine's
+        # Iteration(N) log is what makes nsys delay_iterations land on the
+        # intended iteration under data parallelism.
+        if scheduler_output.total_num_scheduled_tokens > 0:
+            self.profiler.step()
 
         iteration_details = compute_iteration_details(scheduler_output)
 
@@ -952,6 +959,14 @@ class Worker(WorkerBase):
             self.profiler.stop()
 
     def execute_dummy_batch(self) -> None:
+        # DP dummy steps still advance the engine-side iteration counter
+        # (see EngineCore.log_iteration_details(None)); tick the worker profiler
+        # in lockstep so the two counters stay 1:1. Tick before _dummy_run (which
+        # runs coordinate_batch_across_dp) so that any counter-driven, cross-rank
+        # coordinated toggle rendezvouses before this step's collectives, exactly
+        # like annotate_profile() does ahead of execute_model().
+        if self.profiler:
+            self.profiler.step()
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
         self.model_runner._dummy_run(num_tokens, uniform_decode=True)
 
