@@ -454,7 +454,11 @@ class EngineCore:
                 [
                     "Iteration(",
                     str(self._iteration_index),
-                    "): ",
+                    # Tag DP dummy/idle iters with "[dp-idle]" right after the
+                    # Iteration(N) prefix so the nsys manual-pin recipe can
+                    # exclude them from a capture window via `grep -v dp-idle`
+                    # (matches misun's vllm-nsys-decode-capture-fix convention).
+                    ") [dp-idle]: " if is_dummy else "): ",
                     str(iteration_details.num_ctx_requests),
                     " context requests, ",
                     str(iteration_details.num_ctx_tokens),
