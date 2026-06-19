@@ -344,6 +344,13 @@ class Worker(WorkerBase):
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
 
+        # Diagnostic-only: arm the nsys capture-under-load freeze watchdog.
+        # No-op unless VLLM_FREEZE_WATCHDOG=1. Dormant until stepping starts,
+        # so it never perturbs warmup / cudagraph capture.
+        from vllm.profiler import freeze_watchdog
+
+        freeze_watchdog.arm(role="decode-worker", rank=self.rank)
+
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
@@ -776,6 +783,13 @@ class Worker(WorkerBase):
         # add trace annotation so that we can easily distinguish
         # context/generation request numbers in each iteration.
         # A context request is a request that has not yet generated any tokens
+
+        # Freeze-watchdog heartbeat: this runs on every real (token>0) engine
+        # step, so a stall here == the step loop wedged. No-op unless enabled.
+        from vllm.profiler import freeze_watchdog
+
+        freeze_watchdog.beat()
+
         if not self.profiler:
             return nullcontext()
 
@@ -967,6 +981,11 @@ class Worker(WorkerBase):
         # like annotate_profile() does ahead of execute_model().
         if self.profiler:
             self.profiler.step()
+        # Freeze-watchdog heartbeat for DP dummy/idle steps (the other half of
+        # the engine iteration stream). No-op unless enabled.
+        from vllm.profiler import freeze_watchdog
+
+        freeze_watchdog.beat()
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
         self.model_runner._dummy_run(num_tokens, uniform_decode=True)
 
