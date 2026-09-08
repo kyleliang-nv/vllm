@@ -303,6 +303,10 @@ class SchedulerOutput:
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
 
+    # Scheduler-owned cached target execution-contract generation.
+    dp_execution_contract_epoch: int | None = None
+    dp_execution_contract_refresh: bool = False
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(
