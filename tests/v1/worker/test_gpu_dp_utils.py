@@ -28,20 +28,24 @@ class _Work:
         remote_reqs: int = 2,
         generation_delta: int = 0,
         remote_need_eager: bool = False,
+        remote_uniform_token_count: int = 1,
+        remote_max_query_len: int = 1,
     ) -> None:
         self.tensor = tensor
         self.remote_tokens = remote_tokens
         self.remote_reqs = remote_reqs
         self.generation_delta = generation_delta
         self.remote_need_eager = remote_need_eager
+        self.remote_uniform_token_count = remote_uniform_token_count
+        self.remote_max_query_len = remote_max_query_len
         self.wait_calls = 0
 
     def wait(self) -> None:
         self.wait_calls += 1
         self.tensor[0, 1] = self.remote_tokens
         self.tensor[1, 1] = CUDAGraphMode.FULL.value
-        self.tensor[2, 1] = 1
-        self.tensor[3, 1] = 1
+        self.tensor[2, 1] = self.remote_uniform_token_count
+        self.tensor[3, 1] = self.remote_max_query_len
         self.tensor[4, 1] = self.remote_reqs
         self.tensor[5, 1] = self.tensor[5, 0] + self.generation_delta
         self.tensor[6, 1] = int(self.remote_need_eager)
@@ -49,12 +53,14 @@ class _Work:
 
 def _graph_manager() -> Mock:
     manager = Mock(spec=CudaGraphManager)
-    manager.dispatch.side_effect = lambda num_reqs, num_tokens, *args, **kwargs: (
+    manager.dispatch.side_effect = lambda num_reqs, num_tokens, uniform, **kwargs: (
         BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.FULL,
             num_tokens=num_tokens,
             num_reqs=num_reqs,
-            uniform_token_count=1,
+            uniform_token_count=uniform,
+            max_query_len=kwargs.get("max_query_len"),
+            num_active_loras=kwargs.get("num_active_loras", 0),
         )
     )
     return manager
@@ -272,3 +278,216 @@ def test_reused_execution_contract_selects_global_request_capacity():
     assert batch_desc.num_reqs == 4
     assert reused is sync
     assert manager.dispatch.call_args.args[:2] == (4, 4)
+
+
+def test_cached_contract_activates_then_skips_collective(monkeypatch):
+    collective_calls = 0
+
+    def all_reduce(tensor, group, async_op):
+        nonlocal collective_calls
+        collective_calls += 1
+        return _Work(tensor, remote_tokens=2, remote_reqs=2)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+    manager = _graph_manager()
+    coordinator = DPSyncCoordinator(
+        2,
+        0,
+        group=Mock(),
+        cache_execution_contract=True,
+        cache_stability_steps=2,
+    )
+
+    for force_refresh in (True, False):
+        future = coordinator.start(
+            manager,
+            2,
+            2,
+            uniform_token_count=1,
+            max_query_len=1,
+            force_refresh=force_refresh,
+            contract_epoch=10,
+            contract_capacity_num_reqs=4,
+        )
+        future.result(manager)
+        future.release()
+
+    cached = coordinator.start(
+        manager,
+        1,
+        1,
+        uniform_token_count=1,
+        max_query_len=1,
+        contract_epoch=10,
+        contract_capacity_num_reqs=4,
+    )
+    batch_desc, sync = cached.result(manager)
+
+    assert collective_calls == 2
+    assert batch_desc.num_tokens == 4
+    assert batch_desc.num_reqs == 4
+    assert sync is not None
+    assert sync.num_reqs == 4
+    assert sync.contract_epoch == 10
+    assert not sync.live_facts_exact
+    cached.release()
+
+
+def test_cached_contract_idle_rank_reuses_capacity(monkeypatch):
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_reduce",
+        lambda tensor, group, async_op: _Work(tensor, remote_tokens=2, remote_reqs=2),
+    )
+    manager = _graph_manager()
+    coordinator = DPSyncCoordinator(
+        2,
+        0,
+        group=Mock(),
+        cache_execution_contract=True,
+        cache_stability_steps=1,
+    )
+    refresh = coordinator.start(
+        manager,
+        2,
+        2,
+        uniform_token_count=1,
+        max_query_len=1,
+        force_refresh=True,
+        contract_epoch=4,
+        contract_capacity_num_reqs=4,
+    )
+    refresh.result(manager)
+    refresh.release()
+
+    idle = coordinator.start(
+        manager,
+        0,
+        0,
+        uniform_token_count=None,
+        max_query_len=0,
+        contract_epoch=4,
+        contract_capacity_num_reqs=4,
+    )
+    batch_desc, sync = idle.result(manager)
+
+    assert batch_desc.num_tokens == 4
+    assert sync is not None and not sync.live_facts_exact
+    idle.release()
+
+
+def test_cached_contract_rejects_local_drift_without_collective(monkeypatch):
+    collective_calls = 0
+
+    def all_reduce(tensor, group, async_op):
+        nonlocal collective_calls
+        collective_calls += 1
+        return _Work(tensor, remote_tokens=2, remote_reqs=2)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+    manager = _graph_manager()
+    coordinator = DPSyncCoordinator(
+        2,
+        0,
+        group=Mock(),
+        cache_execution_contract=True,
+        cache_stability_steps=1,
+    )
+    refresh = coordinator.start(
+        manager,
+        2,
+        2,
+        uniform_token_count=1,
+        max_query_len=1,
+        force_refresh=True,
+        contract_epoch=8,
+        contract_capacity_num_reqs=4,
+    )
+    refresh.result(manager)
+    refresh.release()
+
+    with pytest.raises(RuntimeError, match="local fallback would change"):
+        coordinator.start(
+            manager,
+            1,
+            2,
+            uniform_token_count=None,
+            max_query_len=2,
+            contract_epoch=8,
+            contract_capacity_num_reqs=4,
+            has_prefill=True,
+        )
+    with pytest.raises(RuntimeError, match="epoch=9, cached=8"):
+        coordinator.start(
+            manager,
+            1,
+            1,
+            uniform_token_count=1,
+            max_query_len=1,
+            contract_epoch=9,
+            contract_capacity_num_reqs=4,
+        )
+
+    assert collective_calls == 1
+    assert coordinator._active_future is None
+
+
+def test_prefill_refresh_invalidates_cached_contract(monkeypatch):
+    collective_calls = 0
+
+    def all_reduce(tensor, group, async_op):
+        nonlocal collective_calls
+        collective_calls += 1
+        return _Work(tensor, remote_tokens=2, remote_reqs=2)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+    manager = _graph_manager()
+    coordinator = DPSyncCoordinator(
+        2,
+        0,
+        group=Mock(),
+        cache_execution_contract=True,
+        cache_stability_steps=1,
+    )
+
+    refresh = coordinator.start(
+        manager,
+        2,
+        2,
+        uniform_token_count=1,
+        max_query_len=1,
+        force_refresh=True,
+        contract_epoch=3,
+        contract_capacity_num_reqs=4,
+    )
+    refresh.result(manager)
+    refresh.release()
+    assert coordinator._cached_contract is not None
+
+    prefill_refresh = coordinator.start(
+        manager,
+        1,
+        2,
+        uniform_token_count=2,
+        max_query_len=2,
+        force_refresh=True,
+        contract_epoch=4,
+        contract_capacity_num_reqs=4,
+        has_prefill=True,
+    )
+    prefill_refresh.result(manager)
+    prefill_refresh.release()
+    assert coordinator._cached_contract is None
+
+    decode = coordinator.start(
+        manager,
+        2,
+        2,
+        uniform_token_count=1,
+        max_query_len=1,
+        contract_epoch=4,
+        contract_capacity_num_reqs=4,
+    )
+    decode.result(manager)
+    decode.release()
+    assert collective_calls == 3

@@ -498,6 +498,12 @@ class EngineArgs:
     data_parallel_backend: DataParallelBackend = ParallelConfig.data_parallel_backend
     enable_expert_parallel: bool = ParallelConfig.enable_expert_parallel
     enable_dp_execution_contract: bool = ParallelConfig.enable_dp_execution_contract
+    enable_cached_dp_execution_contract: bool = (
+        ParallelConfig.enable_cached_dp_execution_contract
+    )
+    dp_execution_contract_stability_steps: int = (
+        ParallelConfig.dp_execution_contract_stability_steps
+    )
     enable_batch_sharded_sampling: bool | None = (
         ParallelConfig.enable_batch_sharded_sampling
     )
@@ -1178,6 +1184,14 @@ class EngineArgs:
         parallel_group.add_argument(
             "--enable-dp-execution-contract",
             **parallel_kwargs["enable_dp_execution_contract"],
+        )
+        parallel_group.add_argument(
+            "--enable-cached-dp-execution-contract",
+            **parallel_kwargs["enable_cached_dp_execution_contract"],
+        )
+        parallel_group.add_argument(
+            "--dp-execution-contract-stability-steps",
+            **parallel_kwargs["dp_execution_contract_stability_steps"],
         )
         parallel_group.add_argument(
             "--enable-batch-sharded-sampling",
@@ -2331,6 +2345,12 @@ class EngineArgs:
             is_moe_model=model_config.is_moe,
             enable_expert_parallel=self.enable_expert_parallel,
             enable_dp_execution_contract=self.enable_dp_execution_contract,
+            enable_cached_dp_execution_contract=(
+                self.enable_cached_dp_execution_contract
+            ),
+            dp_execution_contract_stability_steps=(
+                self.dp_execution_contract_stability_steps
+            ),
             enable_batch_sharded_sampling=self.enable_batch_sharded_sampling,
             enable_ep_weight_filter=self.enable_ep_weight_filter,
             all2all_backend=self.all2all_backend,

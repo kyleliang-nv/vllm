@@ -430,9 +430,10 @@ def _setup_remote_kv_resume(num_prompt_tokens: int, matched_tokens: int):
     return scheduler
 
 
-def test_throttle_prefills_defers_fully_transferred_remote_kv_prompt_tail():
-    """A remote-KV resume whose prompt was transferred still has a prompt-tail
-    step. Defer it so all prompt-related work remains cadence-aligned.
+def test_throttle_prefills_defers_fully_transferred_prompt_tail():
+    """A remote-KV resume remains a prompt-tail transition even when its
+    prompt KV was fully transferred. Keep that transition on the authoritative
+    cadence so cached decode-only execution contracts cannot admit it early.
     """
     block_size = 16
     num_prompt = block_size * 2
@@ -442,6 +443,9 @@ def test_throttle_prefills_defers_fully_transferred_remote_kv_prompt_tail():
     output = scheduler.schedule(throttle_prefills=True)
     assert "r2" not in output.num_scheduled_tokens
     assert "r1" in output.num_scheduled_tokens
+
+    output = scheduler.schedule()
+    assert "r2" in output.num_scheduled_tokens
 
 
 def test_throttle_prefills_defers_remote_kv_resume_with_local_prefill():
