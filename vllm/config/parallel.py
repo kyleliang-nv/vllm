@@ -248,6 +248,16 @@ class ParallelConfig:
     and one-sided FlashInfer configuration.
     """
 
+    enable_cached_dp_execution_contract: bool = False
+    """Reuse a scheduler-epoched target execution contract between refreshes.
+
+    Requires ``enable_dp_execution_contract``. Refresh cadence follows
+    ``SchedulerConfig.prefill_schedule_interval`` and is experimental.
+    """
+
+    dp_execution_contract_stability_steps: int = Field(default=2, ge=1)
+    """Matching authoritative observations required before caching a contract."""
+
     ray_workers_use_nsight: bool = False
     """Whether to profile Ray workers with nsight, see https://docs.ray.io/en/latest/ray-observability/user-guides/profiling.html#profiling-nsight-profiler."""
 

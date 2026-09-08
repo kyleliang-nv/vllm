@@ -14,6 +14,8 @@ pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
 def _config():
     parallel = SimpleNamespace(
         enable_dp_execution_contract=True,
+        enable_cached_dp_execution_contract=False,
+        dp_execution_contract_stability_steps=2,
         data_parallel_size=2,
         enable_expert_parallel=True,
         all2all_backend="flashinfer_nvlink_one_sided",
@@ -32,7 +34,10 @@ def _config():
     return SimpleNamespace(
         parallel_config=parallel,
         model_config=model,
-        scheduler_config=SimpleNamespace(async_scheduling=False),
+        scheduler_config=SimpleNamespace(
+            async_scheduling=False,
+            prefill_schedule_interval=1,
+        ),
         lora_config=None,
         speculative_config=None,
         use_v2_model_runner=True,
@@ -70,4 +75,31 @@ def test_dp_execution_contract_requires_padding_mask(monkeypatch):
     monkeypatch.setattr(envs, "VLLM_MOE_SKIP_PADDING", False)
 
     with pytest.raises(ValueError, match="VLLM_MOE_SKIP_PADDING=0"):
+        VllmConfig._verify_dp_execution_contract(config)
+
+
+def test_cached_contract_requires_target_contract():
+    config = _config()
+    config.parallel_config.enable_dp_execution_contract = False
+    config.parallel_config.enable_cached_dp_execution_contract = True
+
+    with pytest.raises(ValueError, match="requires enable_dp_execution_contract"):
+        VllmConfig._verify_dp_execution_contract(config)
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_cached_contract_accepts_scheduler_owned_epoch(async_scheduling):
+    config = _config()
+    config.parallel_config.enable_cached_dp_execution_contract = True
+    config.scheduler_config.prefill_schedule_interval = 32
+    config.scheduler_config.async_scheduling = async_scheduling
+
+    VllmConfig._verify_dp_execution_contract(config)
+
+
+def test_cached_contract_requires_refresh_cadence():
+    config = _config()
+    config.parallel_config.enable_cached_dp_execution_contract = True
+
+    with pytest.raises(ValueError, match="prefill_schedule_interval <= 1"):
         VllmConfig._verify_dp_execution_contract(config)

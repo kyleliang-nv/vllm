@@ -1280,7 +1280,11 @@ class Worker(WorkerBase):
                     # Recreate it so the next profile_prefix is honored.
                     self.profiler = None
 
-    def execute_dummy_batch(self) -> None:
+    def execute_dummy_batch(
+        self,
+        dp_execution_contract_refresh: bool = False,
+        dp_execution_contract_epoch: int | None = None,
+    ) -> None:
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
         if getattr(self.model_runner, "dp_execution_contract_enabled", False):
             self.model_runner._dummy_run(
@@ -1288,6 +1292,8 @@ class Worker(WorkerBase):
                 uniform_decode=True,
                 valid_dummy_state_slots=True,
                 dp_idle=True,
+                dp_execution_contract_refresh=dp_execution_contract_refresh,
+                dp_execution_contract_epoch=dp_execution_contract_epoch,
             )
         else:
             self.model_runner._dummy_run(num_tokens, uniform_decode=True)
