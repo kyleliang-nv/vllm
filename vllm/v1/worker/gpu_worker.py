@@ -1282,7 +1282,15 @@ class Worker(WorkerBase):
 
     def execute_dummy_batch(self) -> None:
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
-        self.model_runner._dummy_run(num_tokens, uniform_decode=True)
+        if getattr(self.model_runner, "dp_execution_contract_enabled", False):
+            self.model_runner._dummy_run(
+                num_tokens,
+                uniform_decode=True,
+                valid_dummy_state_slots=True,
+                dp_idle=True,
+            )
+        else:
+            self.model_runner._dummy_run(num_tokens, uniform_decode=True)
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)
